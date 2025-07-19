@@ -10,6 +10,7 @@
 // function region.
 //
 //===----------------------------------------------------------------------===//
+#include "FlattenHelpers.h"
 #include "PassDetail.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/PatternMatch.h"
@@ -914,22 +915,25 @@ void populateFlattenCFGPatterns(RewritePatternSet &patterns) {
 }
 
 void FlattenCFGPass::runOnOperation() {
-  RewritePatternSet patterns(&getContext());
-  populateFlattenCFGPatterns(patterns);
-
-  // Collect operations to apply patterns.
-  llvm::SmallVector<Operation *, 16> ops;
-  getOperation()->walk<mlir::WalkOrder::PostOrder>([&](Operation *op) {
-    if (isa<IfOp, ScopeOp, SwitchOp, LoopOpInterface, TernaryOp, TryOp>(op))
-      ops.push_back(op);
-  });
-
-  // Apply patterns.
-  if (applyOpPatternsGreedily(ops, std::move(patterns)).failed())
+  if (flattenCFGForOperation(getOperation()).failed())
     signalPassFailure();
 }
 
 } // namespace
+
+mlir::LogicalResult cir::flattenCFGForOperation(mlir::Operation *op) {
+  RewritePatternSet patterns(op->getContext());
+  populateFlattenCFGPatterns(patterns);
+
+  // Collect operations to apply patterns.
+  llvm::SmallVector<Operation *, 16> ops;
+  op->walk<mlir::WalkOrder::PostOrder>([&](Operation *op) {
+    if (isa<IfOp, ScopeOp, SwitchOp, LoopOpInterface, TernaryOp, TryOp>(op))
+      ops.push_back(op);
+  });
+
+  return applyOpPatternsGreedily(ops, std::move(patterns));
+}
 
 namespace mlir {
 

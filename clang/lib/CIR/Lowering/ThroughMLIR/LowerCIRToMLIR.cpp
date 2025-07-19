@@ -920,11 +920,21 @@ class CIRScopeOpLowering : public mlir::OpConversionPattern<cir::ScopeOp> {
       return mlir::success();
     }
 
-    for (auto &block : scopeOp.getScopeRegion()) {
-      rewriter.setInsertionPointToEnd(&block);
-      auto *terminator = block.getTerminator();
-      rewriter.replaceOpWithNewOp<mlir::memref::AllocaScopeReturnOp>(
-          terminator, terminator->getOperands());
+    // This scope might have been flattened. In that case, we don't replace
+    // the terminators of the blocks.
+    auto &region = scopeOp.getScopeRegion();
+    bool flattened =
+        std::any_of(region.begin(), region.end(), [](mlir::Block &block) {
+          return isa<BrOp, BrCondOp, SwitchFlatOp>(block.getTerminator());
+        });
+
+    if (!flattened) {
+      for (auto &block : region) {
+        rewriter.setInsertionPointToEnd(&block);
+        auto *terminator = block.getTerminator();
+        rewriter.replaceOpWithNewOp<mlir::memref::AllocaScopeReturnOp>(
+            terminator, terminator->getOperands());
+      }
     }
 
     SmallVector<mlir::Type> mlirResultTypes;
@@ -934,6 +944,23 @@ class CIRScopeOpLowering : public mlir::OpConversionPattern<cir::ScopeOp> {
     rewriter.setInsertionPoint(scopeOp);
     auto newScopeOp = rewriter.create<mlir::memref::AllocaScopeOp>(
         scopeOp.getLoc(), mlirResultTypes);
+
+    // If the scope op is flattened, then we need an `scf.execute_region`
+    // to wrap it around. This is because memref.alloca_scope accepts
+    // only a single region.
+    if (flattened) {
+      auto *block = rewriter.createBlock(&newScopeOp.getBodyRegion());
+      rewriter.setInsertionPointToStart(block);
+      auto execRegion = rewriter.create<mlir::scf::ExecuteRegionOp>(
+          scopeOp.getLoc(), mlirResultTypes);
+      rewriter.inlineRegionBefore(scopeOp.getScopeRegion(),
+                                  execRegion.getRegion(),
+                                  execRegion.getRegion().end());
+      rewriter.create<mlir::memref::AllocaScopeReturnOp>(scopeOp.getLoc());
+      rewriter.replaceOp(scopeOp, newScopeOp);
+      return mlir::success();
+    }
+
     rewriter.inlineRegionBefore(scopeOp.getScopeRegion(),
                                 newScopeOp.getBodyRegion(),
                                 newScopeOp.getBodyRegion().end());
@@ -993,7 +1020,8 @@ public:
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto *parentOp = op->getParentOp();
     return llvm::TypeSwitch<mlir::Operation *, mlir::LogicalResult>(parentOp)
-        .Case<mlir::scf::IfOp, mlir::scf::ForOp, mlir::scf::WhileOp>([&](auto) {
+        .Case<mlir::scf::IfOp, mlir::scf::ForOp, mlir::scf::WhileOp,
+              mlir::scf::ExecuteRegionOp>([&](auto) {
           rewriter.replaceOpWithNewOp<mlir::scf::YieldOp>(
               op, adaptor.getOperands());
           return mlir::success();
@@ -1581,29 +1609,54 @@ public:
   }
 };
 
+class CIRSwitchFlatOpLowering
+    : public mlir::OpConversionPattern<cir::SwitchFlatOp> {
+public:
+  using OpConversionPattern<SwitchFlatOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::SwitchFlatOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    llvm::ArrayRef<mlir::Attribute> caseValuesAttr =
+        op.getCaseValues().getValue();
+    llvm::SmallVector<llvm::APInt> caseValues;
+    for (auto attr : caseValuesAttr) {
+      // These case values are #cir.int attributes.
+      auto intAttr = cast<cir::IntAttr>(attr);
+      caseValues.push_back(
+          llvm::APInt(intAttr.getBitWidth(), intAttr.getSInt()));
+    }
+
+    rewriter.replaceOpWithNewOp<mlir::cf::SwitchOp>(
+        op, adaptor.getCondition(), op.getDefaultDestination(),
+        adaptor.getDefaultOperands(), caseValues, op.getCaseDestinations(),
+        adaptor.getCaseOperands());
+    return mlir::success();
+  }
+};
+
 void populateCIRToMLIRConversionPatterns(mlir::RewritePatternSet &patterns,
                                          mlir::TypeConverter &converter) {
   patterns.add<CIRReturnLowering, CIRBrOpLowering>(patterns.getContext());
 
-  patterns
-      .add<CIRSwitchOpLowering, CIRATanOpLowering, CIRCmpOpLowering,
-           CIRCallOpLowering, CIRUnaryOpLowering, CIRBinOpLowering,
-           CIRLoadOpLowering, CIRConstantOpLowering, CIRStoreOpLowering,
-           CIRAllocaOpLowering, CIRFuncOpLowering, CIRScopeOpLowering,
-           CIRBrCondOpLowering, CIRTernaryOpLowering, CIRYieldOpLowering,
-           CIRCosOpLowering, CIRGlobalOpLowering, CIRGetGlobalOpLowering,
-           CIRCastOpLowering, CIRPtrStrideOpLowering, CIRSqrtOpLowering,
-           CIRCeilOpLowering, CIRExp2OpLowering, CIRExpOpLowering,
-           CIRFAbsOpLowering, CIRAbsOpLowering, CIRFloorOpLowering,
-           CIRLog10OpLowering, CIRLog2OpLowering, CIRLogOpLowering,
-           CIRRoundOpLowering, CIRPtrStrideOpLowering, CIRSinOpLowering,
-           CIRShiftOpLowering, CIRBitClzOpLowering, CIRBitCtzOpLowering,
-           CIRBitPopcountOpLowering, CIRBitClrsbOpLowering, CIRBitFfsOpLowering,
-           CIRBitParityOpLowering, CIRIfOpLowering, CIRVectorCreateLowering,
-           CIRVectorInsertLowering, CIRVectorExtractLowering,
-           CIRVectorCmpOpLowering, CIRACosOpLowering, CIRASinOpLowering,
-           CIRUnreachableOpLowering, CIRTanOpLowering, CIRTrapOpLowering>(
-          converter, patterns.getContext());
+  patterns.add<
+      CIRSwitchOpLowering, CIRSwitchFlatOpLowering, CIRATanOpLowering,
+      CIRCmpOpLowering, CIRCallOpLowering, CIRUnaryOpLowering, CIRBinOpLowering,
+      CIRLoadOpLowering, CIRConstantOpLowering, CIRStoreOpLowering,
+      CIRAllocaOpLowering, CIRFuncOpLowering, CIRScopeOpLowering,
+      CIRBrCondOpLowering, CIRTernaryOpLowering, CIRYieldOpLowering,
+      CIRCosOpLowering, CIRGlobalOpLowering, CIRGetGlobalOpLowering,
+      CIRCastOpLowering, CIRPtrStrideOpLowering, CIRSqrtOpLowering,
+      CIRCeilOpLowering, CIRExp2OpLowering, CIRExpOpLowering, CIRFAbsOpLowering,
+      CIRAbsOpLowering, CIRFloorOpLowering, CIRLog10OpLowering,
+      CIRLog2OpLowering, CIRLogOpLowering, CIRRoundOpLowering,
+      CIRPtrStrideOpLowering, CIRSinOpLowering, CIRShiftOpLowering,
+      CIRBitClzOpLowering, CIRBitCtzOpLowering, CIRBitPopcountOpLowering,
+      CIRBitClrsbOpLowering, CIRBitFfsOpLowering, CIRBitParityOpLowering,
+      CIRIfOpLowering, CIRVectorCreateLowering, CIRVectorInsertLowering,
+      CIRVectorExtractLowering, CIRVectorCmpOpLowering, CIRACosOpLowering,
+      CIRASinOpLowering, CIRUnreachableOpLowering, CIRTanOpLowering,
+      CIRTrapOpLowering, CIRGetElementOpLowering>(converter, patterns.getContext());
 }
 
 static mlir::TypeConverter prepareTypeConverter() {
