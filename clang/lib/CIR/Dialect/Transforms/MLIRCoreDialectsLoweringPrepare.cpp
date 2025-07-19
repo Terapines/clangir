@@ -6,9 +6,11 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "FlattenHelpers.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "clang/CIR/Dialect/Builder/CIRBaseBuilder.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
@@ -25,6 +27,13 @@ struct MLIRLoweringPrepare
   // We need to copy the next branch's body when the current `cir.case` does
   // not terminate with a break.
   void removeFallthrough(llvm::SmallVector<CaseOp> &cases);
+  // When the switch is not canonical, i.e. it jumps into other regions,
+  // we must flatten its content.
+  void flattenSwitch(SwitchOp switchOp);
+
+  // The `isSimpleForm` function only cares about scopes.
+  // Here we also need to make sure cases don't jump into other regions.
+  bool isCanonicalForm(SwitchOp switchOp, llvm::SmallVector<CaseOp> &cases);
 
   void runOnOp(mlir::Operation *op);
   void runOnOperation() final;
@@ -35,6 +44,22 @@ struct MLIRLoweringPrepare
 
   StringRef getArgument() const override { return "mlir-lowering-prepare"; }
 };
+
+bool MLIRLoweringPrepare::isCanonicalForm(SwitchOp switchOp, llvm::SmallVector<CaseOp> &cases) {
+  if (!switchOp.isSimpleForm(cases))
+    return false;
+
+  return std::all_of(cases.begin(), cases.end(), [&](CaseOp op) {
+    return op->getParentOp() == switchOp;
+  });
+}
+
+void MLIRLoweringPrepare::flattenSwitch(SwitchOp switchOp) {
+  auto module = switchOp->getParentOfType<mlir::ModuleOp>();
+  if (mlir::failed(flattenCFGForOperation(switchOp)))
+    signalPassFailure();
+  module.dump();
+}
 
 // `scf.index_switch` requires that switch branches do not fall through.
 // We need to copy the next branch's body when the current `cir.case` does not
@@ -52,10 +77,9 @@ void MLIRLoweringPrepare::removeFallthrough(llvm::SmallVector<CaseOp> &cases) {
 
     // The last op must be a `cir.yield`. As it falls through, we copy the
     // previous case's body to this one.
-    if (!isa<YieldOp>(last)) {
-      caseOp->dump();
+    if (!isa<YieldOp>(last))
       continue;
-    }
+    
     assert(isa<YieldOp>(last));
 
     // If there's no previous case, we can simply change the yield into a break.
@@ -91,8 +115,10 @@ void MLIRLoweringPrepare::removeFallthrough(llvm::SmallVector<CaseOp> &cases) {
 void MLIRLoweringPrepare::runOnOp(mlir::Operation *op) {
   if (auto switchOp = dyn_cast<SwitchOp>(op)) {
     llvm::SmallVector<CaseOp> cases;
-    if (!switchOp.isSimpleForm(cases))
-      op->emitError("NYI");
+    if (!isCanonicalForm(switchOp, cases)) {
+      flattenSwitch(switchOp);
+      return;
+    }
 
     removeFallthrough(cases);
     return;

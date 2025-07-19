@@ -921,11 +921,20 @@ class CIRScopeOpLowering : public mlir::OpConversionPattern<cir::ScopeOp> {
       return mlir::success();
     }
 
-    for (auto &block : scopeOp.getScopeRegion()) {
-      rewriter.setInsertionPointToEnd(&block);
-      auto *terminator = block.getTerminator();
-      rewriter.replaceOpWithNewOp<mlir::memref::AllocaScopeReturnOp>(
-          terminator, terminator->getOperands());
+    // This scope might have been flattened. In that case, we don't replace
+    // the terminators of the blocks.
+    auto &region = scopeOp.getScopeRegion();
+    bool flattened = std::any_of(region.begin(), region.end(), [](mlir::Block &block) {
+      return isa<BrOp, BrCondOp>(block.getTerminator());
+    });
+
+    if (!flattened) {
+      for (auto &block : region) {
+        rewriter.setInsertionPointToEnd(&block);
+        auto *terminator = block.getTerminator();
+        rewriter.replaceOpWithNewOp<mlir::memref::AllocaScopeReturnOp>(
+            terminator, terminator->getOperands());
+      }
     }
 
     SmallVector<mlir::Type> mlirResultTypes;
