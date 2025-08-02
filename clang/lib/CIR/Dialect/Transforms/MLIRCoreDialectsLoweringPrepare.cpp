@@ -29,13 +29,18 @@ struct MLIRLoweringPrepare
   void removeFallthrough(llvm::SmallVector<CaseOp> &cases);
   // When the switch is not canonical, i.e. it jumps into other regions,
   // we must flatten its content.
-  void flattenSwitch(SwitchOp switchOp);
+  void flatten(mlir::Operation *op);
 
   // The `isSimpleForm` function only cares about scopes.
   // Here we also need to make sure cases don't jump into other regions.
   bool isCanonicalForm(SwitchOp switchOp, llvm::SmallVector<CaseOp> &cases);
 
+  // Finds the least common ancestor (LCA) of two basic blocks.
+  // This means to find the lowest operation whose region contains both blocks.
+  mlir::Operation *findLCA(mlir::Block *a, mlir::Block *b);
+
   void runOnOp(mlir::Operation *op);
+  void runOnFunction(cir::FuncOp func);
   void runOnOperation() final;
 
   StringRef getDescription() const override {
@@ -43,6 +48,8 @@ struct MLIRLoweringPrepare
   }
 
   StringRef getArgument() const override { return "mlir-lowering-prepare"; }
+private:
+  llvm::StringMap<mlir::Block*> labels;
 };
 
 bool MLIRLoweringPrepare::isCanonicalForm(SwitchOp switchOp, llvm::SmallVector<CaseOp> &cases) {
@@ -54,9 +61,32 @@ bool MLIRLoweringPrepare::isCanonicalForm(SwitchOp switchOp, llvm::SmallVector<C
   });
 }
 
-void MLIRLoweringPrepare::flattenSwitch(SwitchOp switchOp) {
+mlir::Operation *MLIRLoweringPrepare::findLCA(mlir::Block *a, mlir::Block *b) {
+  // Collect all parent operations of `a`.
+  llvm::SmallDenseSet<mlir::Operation *, 8> ancestors;
+  for (auto *runner = a->getParent(); runner; runner = runner->getParentRegion()) {
+    mlir::Operation *op = runner->getParentOp();
+    if (!op)
+      break;
+    ancestors.insert(op);
+  }
+
+  // Enumerate `b`'s ancestors and look them up.
+  for (auto *runner = b->getParent(); runner; runner = runner->getParentRegion()) {
+    mlir::Operation *op = runner->getParentOp();
+    if (!op)
+      break;
+    if (ancestors.contains(op))
+      return op;
+  }
+
+  mlir::emitError(a->getParent()->getLoc(), "goto and label have no common ancestors!");
+  return nullptr;
+}
+
+void MLIRLoweringPrepare::flatten(mlir::Operation *op) {
   // Move the switch inside a block.
-  if (mlir::failed(flattenCFGForOperation(switchOp)))
+  if (mlir::failed(flattenCFGForOperation(op)))
     signalPassFailure();
 }
 
@@ -115,27 +145,48 @@ void MLIRLoweringPrepare::runOnOp(mlir::Operation *op) {
   if (auto switchOp = dyn_cast<SwitchOp>(op)) {
     llvm::SmallVector<CaseOp> cases;
     if (!isCanonicalForm(switchOp, cases)) {
-      flattenSwitch(switchOp);
+      flatten(switchOp);
       return;
     }
 
     removeFallthrough(cases);
     return;
   }
+  if (auto gotoOp = dyn_cast<GotoOp>(op)) {
+    auto labelName = gotoOp.getLabel();
+    mlir::Block *target = labels[labelName];
+    mlir::Block *source = gotoOp->getBlock();
+    mlir::Operation *lca = findLCA(target, source);
+    // Only these operations can be flattened.
+    flatten(lca);
+    return;
+  }
   op->emitError("unexpected op type");
 }
 
-void MLIRLoweringPrepare::runOnOperation() {
-  auto module = getOperation();
+void MLIRLoweringPrepare::runOnFunction(cir::FuncOp func) {
+  labels.clear();
 
   llvm::SmallVector<mlir::Operation *> opsToTransform;
-  module->walk([&](mlir::Operation *op) {
-    if (isa<SwitchOp>(op))
+  func.getBody().walk([&](mlir::Operation *op) {
+    if (isa<SwitchOp, GotoOp>(op))
       opsToTransform.push_back(op);
+    if (auto label = dyn_cast<LabelOp>(op))
+      labels.try_emplace(label.getLabel(), label->getBlock());
   });
 
   for (auto *op : opsToTransform)
     runOnOp(op);
+}
+
+void MLIRLoweringPrepare::runOnOperation() {
+  auto module = getOperation();
+  llvm::SmallVector<cir::FuncOp> functions;
+  module->walk([&](cir::FuncOp op) {
+    functions.push_back(op);
+  });
+  for (auto func : functions)
+    runOnFunction(func);
 }
 
 std::unique_ptr<mlir::Pass> createMLIRCoreDialectsLoweringPreparePass() {
